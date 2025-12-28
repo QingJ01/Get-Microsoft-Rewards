@@ -17,9 +17,7 @@
 ## 📸 界面预览
 
 > 极简设计，右下角悬浮窗，点击展开即可查看所有任务进度
-
-![界面预览](<img width="385" height="554" alt="图片" src="https://github.com/user-attachments/assets/53078d01-a10f-42f8-8fe4-1b6d73adab67" />
-)
+<img width="385" alt="界面预览" src="https://github.com/user-attachments/assets/53078d01-a10f-42f8-8fe4-1b6d73adab67" />
 
 *收起状态*：右下角礼盒图标，不占用视线  
 *展开状态*：清晰显示等级、积分、各项任务进度
