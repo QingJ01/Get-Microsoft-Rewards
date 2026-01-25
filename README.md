@@ -4,7 +4,7 @@
 
 **微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。**
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/QingJ/get-microsoft-rewards)
+[![Version](https://img.shields.io/badge/version-1.0.1-blue.svg)](https://github.com/QingJ/get-microsoft-rewards)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-v4.0+-orange.svg)](https://www.tampermonkey.net/)
 
@@ -45,6 +45,9 @@
 - 🎲 **随机延迟** - 模拟真实用户行为，降低风控风险
 - 🌐 **热搜词库** - 使用真实热搜词，搜索更自然
 - 🍪 **Cookie 隔离** - 精准控制移动/PC 搜索判定
+- ⏸️ **暂停机制** - 每 10 次搜索自动暂停 15 分钟，降低风险
+- ⏳ **精确计时** - 使用时间戳计算，不受后台/标签页影响
+- 💾 **进度保存** - 刷新页面不丢失进度，自动续接任务
 
 ---
 
@@ -122,10 +125,11 @@
 const CONFIG = {
     pc: { minDelay: 15000, maxDelay: 30000 },      // PC搜索间隔（毫秒）
     mobile: { minDelay: 20000, maxDelay: 35000 },  // 移动搜索间隔（毫秒）
-    hotApi: {
-        enabled: true,                              // 是否启用热搜API
-        url: 'https://hot.baiwumm.com/api/',
-        sources: ['weibo', 'douyin', 'baidu', 'zhihu', 'toutiao']
+    hotApis: [ ... ],                              // 多个热搜源备用
+    pause: {
+        enabled: true,           // 是否启用暂停机制
+        interval: 10,            // 每10次搜索暂停
+        duration: 900000         // 暂停时长 (15分钟)
     }
 };
 ```
