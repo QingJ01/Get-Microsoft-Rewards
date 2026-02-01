@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Get Microsoft Rewards
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1.1
+// @version      1.0.1.2
 // @description  微软 Rewards 助手 - 自动完成搜索、活动、签到、阅读任务，配备极简 UI 悬浮窗，一键全自动获取积分。
 // @author       QingJ
 // @icon         https://rewards.bing.com/rewardscdn/images/rewards.png
@@ -69,12 +69,16 @@
         accessToken: null,
         accessTokenExpiresAt: 0,
         updating: false,
+        updatingPromise: null,
         // 新增：搜索进度和暂停状态
         searchCount: 0,           // 当前搜索计数（用于暂停判断）
         isPaused: false,          // 是否处于暂停状态
         pauseEndTime: 0,          // 暂停结束时间戳
         countdownStartTime: 0,    // 倒计时开始时间（精确计时）
-        countdownDuration: 0      // 倒计时总时长
+        countdownDuration: 0,     // 倒计时总时长
+        manualPaused: false,      // 手动暂停
+        pausePromise: null,
+        pauseResolver: null
     };
     let dashboard = null;
     let loginCookie = '';
@@ -440,6 +444,52 @@
         nodes.logBox.scrollTop = nodes.logBox.scrollHeight;
     };
 
+    const updateAllButton = () => {
+        if (!nodes.btnAll) return;
+        if (state.manualPaused) {
+            nodes.btnAll.textContent = '▶️ 继续执行';
+        } else if (state.running || state.allRunning || state.busyCount > 0) {
+            nodes.btnAll.textContent = '⏸️ 暂停执行';
+        } else {
+            nodes.btnAll.textContent = '🚀 一键全部执行';
+        }
+    };
+
+    const setManualPause = (paused, opts = {}) => {
+        if (paused === state.manualPaused) return;
+        const silent = !!opts.silent;
+        state.manualPaused = paused;
+        if (paused) {
+            if (!state.pausePromise) {
+                state.pausePromise = new Promise(resolve => { state.pauseResolver = resolve; });
+            }
+        } else if (state.pauseResolver) {
+            const resolve = state.pauseResolver;
+            state.pauseResolver = null;
+            state.pausePromise = null;
+            resolve();
+        }
+        updateAllButton();
+        if (!silent) {
+            log(paused ? '⏸️ 已手动暂停' : '▶️ 已继续执行');
+        }
+    };
+
+    const markBusy = (delta) => {
+        state.busyCount = Math.max(0, state.busyCount + delta);
+        updateAllButton();
+    };
+
+    const waitWhilePaused = async () => {
+        if (!state.manualPaused) return 0;
+        if (!state.pausePromise) {
+            state.pausePromise = new Promise(resolve => { state.pauseResolver = resolve; });
+        }
+        const start = Date.now();
+        await state.pausePromise;
+        return Date.now() - start;
+    };
+
     // 授权相关
     const AUTH_URL = 'https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&response_type=code&redirect_uri=https://login.live.com/oauth20_desktop.srf';
 
@@ -447,7 +497,7 @@
 
     nodes.btnAuthSave.onclick = () => {
         const val = nodes.inAuth.value.trim();
-        const match = val.match(/M\.[\w+.]+(-\w+){4}/);
+        const match = val.match(/M\.[^&]+/);
         if (match) {
             GM_setValue('auth_code', match[0]);
             log('✅ 授权码已保存！');
@@ -456,6 +506,7 @@
             log('❌ 格式错误，请复制完整URL');
         }
     };
+    updateAllButton();
 
     async function checkAuth() {
         const code = GM_getValue('auth_code');
@@ -471,84 +522,88 @@
 
     // 数据刷新
     async function updateData() {
-        if (state.updating) return;
+        if (state.updatingPromise) return state.updatingPromise;
         state.updating = true;
-        try {
-            const res = await gmRequest({
-                url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
-                headers: {
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    'Referer': 'https://rewards.bing.com/'
-                },
-                anonymous: false  // 确保携带 cookie
-            });
-
-            if (!res) {
-                log('⚠️ 获取数据失败：空响应');
-                return;
-            }
-
-            let data;
+        state.updatingPromise = (async () => {
             try {
-                data = JSON.parse(res);
+                const res = await gmRequest({
+                    url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
+                    headers: {
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                        'Referer': 'https://rewards.bing.com/'
+                    },
+                    anonymous: false  // 确保携带 cookie
+                });
+
+                if (!res) {
+                    log('⚠️ 获取数据失败：空响应');
+                    return;
+                }
+
+                let data;
+                try {
+                    data = JSON.parse(res);
+                } catch (e) {
+                    log('⚠️ 解析数据失败，请确保已登录 rewards.bing.com');
+                    console.error('Response:', res.substring(0, 200));
+                    return;
+                }
+
+                dashboard = data.dashboard || data;
+
+                if (!dashboard || !dashboard.userStatus) {
+                    log('⚠️ 未获取到用户数据，请先登录 rewards.bing.com');
+                    return;
+                }
+
+                const user = dashboard.userStatus || {};
+                // 修复等级解析：处理 "newLevel1" 格式
+                const rawLevel = user.levelInfo?.activeLevel || 'Level1';
+                state.level = parseInt(String(rawLevel).replace(/\D/g, '')) || 1;
+                state.points = user.availablePoints || 0;
+
+                const c = user.counters || {};
+                let pc = 0, pcM = 0, mob = 0, mobM = 0;
+
+                // PC搜索
+                if (c.pcSearch) {
+                    c.pcSearch.forEach(i => { pc += i.pointProgress || 0; pcM += i.pointProgressMax || i.pointMax || 0 });
+                }
+
+                // 移动搜索
+                if (c.mobileSearch) {
+                    c.mobileSearch.forEach(i => { mob += i.pointProgress || 0; mobM += i.pointProgressMax || i.pointMax || 0 });
+                }
+
+                // 如果移动搜索上限为0且等级>1，尝试推断 (Lv2通常是60分)
+                if (mobM === 0 && state.level > 1) {
+                    mobM = 60; // 假设值
+                }
+
+                // 如果PC搜索上限为0，尝试推断
+                if (pcM === 0) {
+                    pcM = state.level > 1 ? 150 : 90; // Lv2=150, Lv1=90
+                }
+
+                state.pcCur = pc; state.pcMax = pcM;
+                state.mobileCur = mob; state.mobileMax = mobM;
+
+                const allP = [...(dashboard.dailySetPromotions?.[getDateStr()] || []), ...(dashboard.morePromotions || [])];
+                state.promosTotal = allP.length;
+                state.promosDone = allP.filter(p => p.complete).length;
+
+                render();
+                log(`✓ 数据已更新: Lv.${state.level} ${state.points}pts`);
             } catch (e) {
-                log('⚠️ 解析数据失败，请确保已登录 rewards.bing.com');
-                console.error('Response:', res.substring(0, 200));
-                return;
+                console.error('updateData error:', e);
+                log(`⚠️ 获取数据出错: ${e.message}`);
+            } finally {
+                state.updating = false;
+                state.updatingPromise = null;
             }
-
-            dashboard = data.dashboard || data;
-
-            if (!dashboard || !dashboard.userStatus) {
-                log('⚠️ 未获取到用户数据，请先登录 rewards.bing.com');
-                return;
-            }
-
-            const user = dashboard.userStatus || {};
-            // 修复等级解析：处理 "newLevel1" 格式
-            const rawLevel = user.levelInfo?.activeLevel || 'Level1';
-            state.level = parseInt(String(rawLevel).replace(/\D/g, '')) || 1;
-            state.points = user.availablePoints || 0;
-
-            const c = user.counters || {};
-            let pc = 0, pcM = 0, mob = 0, mobM = 0;
-
-            // PC搜索
-            if (c.pcSearch) {
-                c.pcSearch.forEach(i => { pc += i.pointProgress || 0; pcM += i.pointProgressMax || i.pointMax || 0 });
-            }
-
-            // 移动搜索
-            if (c.mobileSearch) {
-                c.mobileSearch.forEach(i => { mob += i.pointProgress || 0; mobM += i.pointProgressMax || i.pointMax || 0 });
-            }
-
-            // 如果移动搜索上限为0且等级>1，尝试推断 (Lv2通常是60分)
-            if (mobM === 0 && state.level > 1) {
-                mobM = 60; // 假设值
-            }
-
-            // 如果PC搜索上限为0，尝试推断
-            if (pcM === 0) {
-                pcM = state.level > 1 ? 150 : 90; // Lv2=150, Lv1=90
-            }
-
-            state.pcCur = pc; state.pcMax = pcM;
-            state.mobileCur = mob; state.mobileMax = mobM;
-
-            const allP = [...(dashboard.dailySetPromotions?.[getDateStr()] || []), ...(dashboard.morePromotions || [])];
-            state.promosTotal = allP.length;
-            state.promosDone = allP.filter(p => p.complete).length;
-
-            render();
-            log(`✓ 数据已更新: Lv.${state.level} ${state.points}pts`);
-        } catch (e) {
-            console.error('updateData error:', e);
-            log(`⚠️ 获取数据出错: ${e.message}`);
-        } finally {
-            state.updating = false;
-        }
+        })();
+        return state.updatingPromise;
     }
 
     function render() {
@@ -613,6 +668,8 @@
     // 签到
     const runSign = async () => {
         nodes.btnSign.disabled = true;
+        markBusy(1);
+        await waitWhilePaused();
         log('⏳ 签到中...');
         try {
             const res = await withAccessTokenRequest(token => gmRequest({
@@ -640,12 +697,15 @@
             }
         } catch (e) { log('❌ 签到出错'); }
         nodes.btnSign.disabled = false;
+        markBusy(-1);
     };
     nodes.btnSign.onclick = runSign;
 
     // 阅读
     const runRead = async () => {
         nodes.btnRead.disabled = true;
+        markBusy(1);
+        await waitWhilePaused();
         log('⏳ 开始阅读任务...');
         try {
             const info = await withAccessTokenRequest(token => gmRequest({
@@ -662,6 +722,7 @@
                     if (cur >= max) { log('✅ 阅读任务已完成'); }
                     else {
                         for (let i = cur; i < max; i++) {
+                            await waitWhilePaused();
                             log(`📖 阅读文章 ${i + 1}/${max}`);
                             await withAccessTokenRequest(token => gmRequest({
                                 method: 'POST',
@@ -683,6 +744,7 @@
             }
         } catch (e) { log('❌ 阅读出错'); }
         nodes.btnRead.disabled = false;
+        markBusy(-1);
     };
     nodes.btnRead.onclick = runRead;
 
@@ -700,6 +762,8 @@
 
     const runPromo = async () => {
         nodes.btnPromo.disabled = true;
+        markBusy(1);
+        await waitWhilePaused();
         log('⏳ 开始执行活动...');
         await updateData();
 
@@ -707,6 +771,7 @@
         if (!token) {
             log('⚠️ 未获取到活动Token，请刷新页面重试');
             nodes.btnPromo.disabled = false;
+            markBusy(-1);
             return;
         }
 
@@ -736,6 +801,7 @@
 
         let count = 0;
         for (const p of taskList) {
+            await waitWhilePaused();
             try {
                 log(`▶️ 执行: ${p.title}`);
 
@@ -779,14 +845,23 @@
     nodes.btnPromo.onclick = runPromo;
 
     const runSearch = async () => {
-        if (state.running) { state.running = false; nodes.btnSearch.textContent = '🔍 搜索'; return; }
+        if (state.running) {
+            state.running = false;
+            if (state.manualPaused) setManualPause(false, { silent: true });
+            nodes.btnSearch.textContent = '🔍 搜索';
+            updateAllButton();
+            return;
+        }
         state.running = true;
         nodes.btnSearch.textContent = '⏹ 停止';
+        updateAllButton();
+        await waitWhilePaused();
 
         await updateData();
 
         // 辅助函数：执行单次搜索并报告活动
         const doSearch = async (query, isMobile) => {
+            await waitWhilePaused();
             const host = isMobile ? 'cn.bing.com' : 'www.bing.com';
             const ua = isMobile ? CONFIG.ua.mobile : CONFIG.ua.pc;
             const deviceCookie = isMobile ? `_Rwho=u=m&ts=${getDateHyphen()}` : `_Rwho=u=d&ts=${getDateHyphen()}`;
@@ -820,12 +895,16 @@
                 };
 
                 // ncheader 请求
-                await gmRequest({
-                    method: 'POST',
-                    url: `https://${host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
-                    headers: reportHeaders,
-                    data: 'wb=1%3bi%3d1%3bv%3d1'
-                });
+                try {
+                    await gmRequest({
+                        method: 'POST',
+                        url: `https://${host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
+                        headers: reportHeaders,
+                        data: 'wb=1%3bi%3d1%3bv%3d1'
+                    });
+                } catch (e) {
+                    log(`⚠️ ncheader 失败: ${e.message}`);
+                }
 
                 // reportActivity 请求
                 await gmRequest({
@@ -845,9 +924,15 @@
         const preciseWait = async (ms) => {
             state.countdownStartTime = Date.now();
             state.countdownDuration = ms;
-            const endTime = Date.now() + ms;
+            let endTime = Date.now() + ms;
 
             while (Date.now() < endTime && state.running) {
+                if (state.manualPaused) {
+                    const pausedMs = await waitWhilePaused();
+                    endTime += pausedMs;
+                    state.countdownStartTime += pausedMs;
+                    continue;
+                }
                 const remaining = Math.max(0, endTime - Date.now());
                 // 更新UI显示剩余时间
                 const secs = Math.ceil(remaining / 1000);
@@ -890,6 +975,7 @@
         if (pcNeed > 0) {
             log(`💻 PC搜索 ${pcNeed}次`);
             for (let i = 0; i < pcNeed && state.running; i++) {
+                await waitWhilePaused();
                 const q = await getHotQuery();
                 await doSearch(q, false);
                 await checkPause(); // 暂停检查
@@ -904,6 +990,7 @@
         if (mobNeed > 0 && state.running) {
             log(`📱 移动搜索 ${mobNeed}次`);
             for (let i = 0; i < mobNeed && state.running; i++) {
+                await waitWhilePaused();
                 const q = await getHotQuery();
                 await doSearch(q, true);
                 await checkPause(); // 暂停检查
@@ -916,19 +1003,30 @@
         await updateData();
         state.running = false;
         nodes.btnSearch.textContent = '🔍 搜索';
+        updateAllButton();
         log('🏁 搜索结束');
         saveProgress(); // 最终保存进度
     };
     nodes.btnSearch.onclick = runSearch;
 
     nodes.btnAll.onclick = async () => {
+        if (state.manualPaused || state.running || state.allRunning || state.busyCount > 0) {
+            setManualPause(!state.manualPaused);
+            return;
+        }
+        state.allRunning = true;
+        updateAllButton();
         log('🚀 一键执行开始');
-        nodes.btnAll.disabled = true;
-        await runSign();
-        await runRead();
-        await runPromo();
-        await runSearch();
-        nodes.btnAll.disabled = false;
+        try {
+            await waitWhilePaused();
+            await runSign();
+            await runRead();
+            await runPromo();
+            await runSearch();
+        } finally {
+            state.allRunning = false;
+            updateAllButton();
+        }
     };
 
     // Init
@@ -949,7 +1047,7 @@
                 }
             } catch { }
         } catch { }
-        log('🌟 脚本就绪 v1.0.0');
+        log('🌟 脚本就绪 v1.0.1.2');
     })();
 
     setInterval(updateData, 60000);
