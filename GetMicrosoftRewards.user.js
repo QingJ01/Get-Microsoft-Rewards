@@ -520,6 +520,22 @@
 
     // ========== 核心逻辑 (简化版引用) ==========
 
+    // Rewards 网站已迁移到 Next.js Dashboard，旧的 /api/getuserinfo 会返回 401。
+    // 从服务端渲染的 RSC 载荷提取刷新面板所需的字段，避免依赖已下线接口。
+    function parseDashboardData(html) {
+        const number = (pattern, fallback = 0, group = 1) => {
+            const match = html.match(pattern);
+            return match ? Number(match[group]) : fallback;
+        };
+        const level = number(/\\"balance\\":\\?([0-9]+),\\"level\\":\\?([0-9]+)/, 1, 2);
+        const points = number(/\\"balance\\":\\?([0-9]+)/, 0);
+        const searchCur = number(/\\"activitiesCompleted\\":\\?([0-9]+),\\"activitiesLabel\\":\\?\\"Search_ProgressLabel\\"/, 0);
+        const searchMax = number(/\\"activitiesLabel\\":\\?\\"Search_ProgressLabel\\",\\"activitiesTotal\\":\\?([0-9]+)/, 0);
+        const completed = (html.match(/\\"isCompleted\\":\\?true/g) || []).length;
+        const total = (html.match(/\\"offerId\\":/g) || []).length;
+        return { level, points, searchCur, searchMax, promosDone: completed, promosTotal: total };
+    }
+
     // 数据刷新
     async function updateData() {
         if (state.updatingPromise) return state.updatingPromise;
@@ -527,13 +543,9 @@
         state.updatingPromise = (async () => {
             try {
                 const res = await gmRequest({
-                    url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
-                    headers: {
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                        'Referer': 'https://rewards.bing.com/'
-                    },
-                    anonymous: false  // 确保携带 cookie
+                    url: `https://rewards.bing.com/dashboard?_=${Date.now()}`,
+                    headers: { 'Accept': 'text/html,application/xhtml+xml', 'Referer': 'https://rewards.bing.com/' },
+                    anonymous: false
                 });
 
                 if (!res) {
@@ -541,40 +553,16 @@
                     return;
                 }
 
-                let data;
-                try {
-                    data = JSON.parse(res);
-                } catch (e) {
-                    log('⚠️ 解析数据失败，请确保已登录 rewards.bing.com');
-                    console.error('Response:', res.substring(0, 200));
-                    return;
-                }
-
-                dashboard = data.dashboard || data;
-
-                if (!dashboard || !dashboard.userStatus) {
+                const data = parseDashboardData(res);
+                if (!data.points && !data.level) {
                     log('⚠️ 未获取到用户数据，请先登录 rewards.bing.com');
                     return;
                 }
-
-                const user = dashboard.userStatus || {};
-                // 修复等级解析：处理 "newLevel1" 格式
-                const rawLevel = user.levelInfo?.activeLevel || 'Level1';
-                state.level = parseInt(String(rawLevel).replace(/\D/g, '')) || 1;
-                state.points = user.availablePoints || 0;
-
-                const c = user.counters || {};
-                let pc = 0, pcM = 0, mob = 0, mobM = 0;
-
-                // PC搜索
-                if (c.pcSearch) {
-                    c.pcSearch.forEach(i => { pc += i.pointProgress || 0; pcM += i.pointProgressMax || i.pointMax || 0 });
-                }
-
-                // 移动搜索
-                if (c.mobileSearch) {
-                    c.mobileSearch.forEach(i => { mob += i.pointProgress || 0; mobM += i.pointProgressMax || i.pointMax || 0 });
-                }
+                // 旧版活动接口的数据结构不再由 Dashboard 返回；保留空结构供活动流程安全判断。
+                dashboard = { dailySetPromotions: {}, morePromotions: [] };
+                state.level = data.level || 1;
+                state.points = data.points;
+                let pc = data.searchCur * 3, pcM = data.searchMax * 3, mob = 0, mobM = 0;
 
                 // 如果移动搜索上限为0且等级>1，尝试推断 (Lv2通常是60分)
                 if (mobM === 0 && state.level > 1) {
@@ -589,9 +577,8 @@
                 state.pcCur = pc; state.pcMax = pcM;
                 state.mobileCur = mob; state.mobileMax = mobM;
 
-                const allP = [...(dashboard.dailySetPromotions?.[getDateStr()] || []), ...(dashboard.morePromotions || [])];
-                state.promosTotal = allP.length;
-                state.promosDone = allP.filter(p => p.complete).length;
+                state.promosTotal = data.promosTotal;
+                state.promosDone = data.promosDone;
 
                 render();
                 log(`✓ 数据已更新: Lv.${state.level} ${state.points}pts`);
@@ -760,6 +747,31 @@
         } catch { return null; }
     }
 
+    // 新版 Earn 页面使用 Server Action；可自动化的公开活动主要是带搜索链接的活动。
+    async function runEarnSearchActivity(activityUrl) {
+        const parsed = new URL(activityUrl);
+        const host = parsed.hostname === 'cn.bing.com' ? 'cn.bing.com' : 'www.bing.com';
+        const query = parsed.searchParams.get('q');
+        if (!query) return false;
+        const searchUrl = parsed.href;
+        const ua = host === 'cn.bing.com' ? CONFIG.ua.mobile : CONFIG.ua.pc;
+        const headers = { 'User-Agent': ua, Referer: `https://${host}/?form=QBLH` };
+        const result = await gmRequest({ url: searchUrl, headers });
+        const ig = result.match(/,IG:\"([^\"]+)\"/)?.[1] || crypto.randomUUID().replace(/-/g, '').toUpperCase();
+        const reportHeaders = { ...headers, Referer: searchUrl, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' };
+        await gmRequest({ method: 'POST', url: `https://${host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`, headers: reportHeaders, data: 'wb=1%3bi%3d1%3bv%3d1' });
+        await gmRequest({ method: 'POST', url: `https://${host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&q=${encodeURIComponent(query)}&ajaxreq=1`, headers: reportHeaders, data: `url=${encodeURIComponent(searchUrl)}&V=web` });
+        return true;
+    }
+
+    async function getEarnActivities() {
+        const html = await gmRequest({ url: `https://rewards.bing.com/earn?_=${Date.now()}`, headers: { Accept: 'text/html,application/xhtml+xml' }, anonymous: false });
+        const urls = new Set();
+        const re = /https:\/\/(?:www|cn)\.bing\.com\/search\?[^\"\\\s]+/gi;
+        for (const match of html.matchAll(re)) urls.add(match[0].replace(/\\u0026/g, '&'));
+        return [...urls];
+    }
+
     const runPromo = async () => {
         nodes.btnPromo.disabled = true;
         markBusy(1);
@@ -767,80 +779,24 @@
         log('⏳ 开始执行活动...');
         await updateData();
 
-        const token = await getSearchToken();
-        if (!token) {
-            log('⚠️ 未获取到活动Token，请刷新页面重试');
-            nodes.btnPromo.disabled = false;
-            markBusy(-1);
-            return;
-        }
-
-        // 收集所有需要完成的任务
-        let taskList = [];
-        const today = getDateStr();
-
-        // 1. 每日任务 (Daily Set)
-        if (dashboard.dailySetPromotions && dashboard.dailySetPromotions[today]) {
-            taskList.push(...dashboard.dailySetPromotions[today]);
-            log(`📅 检测到 ${dashboard.dailySetPromotions[today].length} 个每日任务`);
-        }
-
-        // 2. 更多活动 (More Activities)
-        if (dashboard.morePromotions) {
-            taskList.push(...dashboard.morePromotions);
-        }
-
-        // 过滤出未完成的任务
-        taskList = taskList.filter(p => !p.complete && p.priority > -2 && p.exclusiveLockedFeatureStatus !== 'locked');
-
-        if (taskList.length === 0) {
-            log('✅ 所有活动已完成！');
-            nodes.btnPromo.disabled = false;
-            return;
-        }
-
         let count = 0;
-        for (const p of taskList) {
+        let activities = [];
+        try { activities = await getEarnActivities(); } catch (e) { log(`❌ 读取活动失败: ${e.message}`); }
+        for (const activityUrl of activities.slice(0, 10)) {
             await waitWhilePaused();
             try {
-                log(`▶️ 执行: ${p.title}`);
-
-                // 请求1: 标准 ReportActivity
-                await gmRequest({
-                    method: 'POST',
-                    url: 'https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    data: `id=${p.offerId}&hash=${p.hash}&activityAmount=1&__RequestVerificationToken=${token}`
-                });
-
-                // 请求2: V1 API (尝试以 Quiz 类型上报，有助于触发某些任务完成)
-                // 构造 V1 API 需要 host，通常是 www.bing.com
-                const v1Url = `https://www.bing.com/msrewards/api/v1/ReportActivity?ajaxreq=1`;
-                await gmRequest({
-                    method: 'POST',
-                    url: v1Url,
-                    headers: { 'Content-Type': 'application/json' },
-                    data: JSON.stringify({
-                        "ActivitySubType": "quiz",
-                        "ActivityType": "notification",
-                        "OfferId": p.offerId,
-                        "Channel": "Bing.Com",
-                        "PartnerId": "BingTrivia",
-                        "Timezone": -480
-                    })
-                });
-
-                // 模拟简单交互延迟
+                log(`▶️ 执行搜索活动: ${new URL(activityUrl).searchParams.get('q') || '活动'}`);
+                if (await runEarnSearchActivity(activityUrl)) count++;
                 await sleep(randomRange(1500, 3000));
-                count++;
             } catch (e) {
                 log(`❌ 活动执行失败: ${e.message}`);
             }
         }
 
-        log(`✅ 完成尝试，共执行 ${count} 个活动`);
+        log(activities.length ? `✅ 完成搜索活动尝试，共执行 ${count} 个活动` : 'ℹ️ 当前 Earn 页面没有可自动执行的搜索活动');
         await updateData(); // 刷新状态
         nodes.btnPromo.disabled = false;
+        markBusy(-1);
     };
     nodes.btnPromo.onclick = runPromo;
 
